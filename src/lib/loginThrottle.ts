@@ -1,8 +1,6 @@
-// Client-side sign-in throttle. NOTE: this is best-effort UX protection only —
-// real per-IP rate limiting requires backend infrastructure (not yet available on this stack).
-const KEY = "buspay.loginAttempts";
+// Per-email login throttle — each email has its own attempt counter
 const MAX = 5;
-const WINDOW_MS = 15 * 60 * 1000; // 15 minutes
+const WINDOW_MS = 15 * 60 * 1000;
 const LOCK_MS = 15 * 60 * 1000;
 
 interface State {
@@ -10,9 +8,13 @@ interface State {
   lockedUntil: number | null;
 }
 
-function read(): State {
+function key(email: string) {
+  return `buspay.loginAttempts.${email.toLowerCase().trim()}`;
+}
+
+function read(email: string): State {
   try {
-    const raw = localStorage.getItem(KEY);
+    const raw = localStorage.getItem(key(email));
     if (!raw) return { attempts: [], lockedUntil: null };
     return JSON.parse(raw) as State;
   } catch {
@@ -20,46 +22,47 @@ function read(): State {
   }
 }
 
-function write(s: State) {
-  localStorage.setItem(KEY, JSON.stringify(s));
+function write(email: string, s: State) {
+  localStorage.setItem(key(email), JSON.stringify(s));
 }
 
-export function getLockRemainingMs(): number {
-  const s = read();
+export function getLockRemainingMs(email = ""): number {
+  if (!email) return 0;
+  const s = read(email);
   if (!s.lockedUntil) return 0;
   const r = s.lockedUntil - Date.now();
   if (r <= 0) {
-    write({ attempts: [], lockedUntil: null });
+    write(email, { attempts: [], lockedUntil: null });
     return 0;
   }
   return r;
 }
 
-export function recordFailedAttempt(): { locked: boolean; remainingMs: number } {
+export function recordFailedAttempt(email: string): { locked: boolean; remainingMs: number } {
   const now = Date.now();
-  const s = read();
+  const s = read(email);
   if (s.lockedUntil && s.lockedUntil > now) {
     return { locked: true, remainingMs: s.lockedUntil - now };
   }
-  // Drop attempts outside the window
   s.attempts = s.attempts.filter((t) => now - t < WINDOW_MS);
   s.attempts.push(now);
   if (s.attempts.length >= MAX) {
     s.lockedUntil = now + LOCK_MS;
-    write(s);
+    write(email, s);
     return { locked: true, remainingMs: LOCK_MS };
   }
-  write(s);
+  write(email, s);
   return { locked: false, remainingMs: 0 };
 }
 
-export function clearAttempts() {
-  write({ attempts: [], lockedUntil: null });
+export function clearAttempts(email: string) {
+  write(email, { attempts: [], lockedUntil: null });
 }
 
-export function attemptsRemaining(): number {
+export function attemptsRemaining(email: string): number {
+  if (!email) return MAX;
   const now = Date.now();
-  const s = read();
+  const s = read(email);
   const recent = s.attempts.filter((t) => now - t < WINDOW_MS);
   return Math.max(0, MAX - recent.length);
 }

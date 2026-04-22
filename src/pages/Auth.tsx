@@ -43,7 +43,7 @@ export default function Auth() {
   const [mode, setMode] = useState<Mode>(search.get("mode") === "signup" ? "signup" : "signin");
   const [method, setMethod] = useState<Method>("email");
   const [submitting, setSubmitting] = useState(false);
-  const [lockMs, setLockMs] = useState(getLockRemainingMs());
+  const [lockMs, setLockMs] = useState(0);
   const [otpSent, setOtpSent] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
   const [forgotSent, setForgotSent] = useState(false);
@@ -54,6 +54,11 @@ export default function Auth() {
   const [otp, setOtp] = useState("");
 
   useEffect(() => { if (user) navigate("/app", { replace: true }); }, [user, navigate]);
+
+  // Update lock state when email changes — per-email throttle
+  useEffect(() => {
+    if (email) setLockMs(getLockRemainingMs(email));
+  }, [email]);
   useEffect(() => {
     if (lockMs <= 0) return;
     const timer = setInterval(() => { const r = getLockRemainingMs(); setLockMs(r); if (r <= 0) clearInterval(timer); }, 1000);
@@ -92,8 +97,8 @@ export default function Auth() {
         setMode("signin"); setPassword("");
       } else {
         const { error } = await supabase.auth.signInWithPassword({ email: cleanEmail, password });
-        if (error) { const r = recordFailedAttempt(); if (r.locked) setLockMs(r.remainingMs); throw error; }
-        clearAttempts(); navigate("/app", { replace: true });
+        if (error) { const r = recordFailedAttempt(cleanEmail); if (r.locked) setLockMs(r.remainingMs); throw error; }
+        clearAttempts(cleanEmail); navigate("/app", { replace: true });
       }
     } catch (err: any) { toast.error(friendlyError(err?.message)); }
     finally { setSubmitting(false); }
@@ -127,8 +132,8 @@ export default function Auth() {
     setSubmitting(true);
     try {
       const { error } = await supabase.auth.verifyOtp({ phone: sanitizePhone(phone), token: otp.replace(/\D/g, "").slice(0, 6), type: "sms" });
-      if (error) { const r = recordFailedAttempt(); if (r.locked) setLockMs(r.remainingMs); throw error; }
-      clearAttempts(); navigate("/app", { replace: true });
+      if (error) { const r = recordFailedAttempt(cleanEmail); if (r.locked) setLockMs(r.remainingMs); throw error; }
+      clearAttempts(cleanEmail); navigate("/app", { replace: true });
     } catch (err: any) { toast.error(friendlyError(err?.message)); }
     finally { setSubmitting(false); }
   };
@@ -240,13 +245,14 @@ export default function Auth() {
                     autoComplete={mode === "signup" ? "new-password" : "current-password"}
                     value={password} onChange={(e) => setPassword(e.target.value)}
                     maxLength={128} required className="h-12 rounded-xl pl-10 pr-10" placeholder="••••••••" />
-                  <button type="button" onClick={() => setShowPassword(!showPassword)}
-                    className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground">
+                  <button type="button"
+                    onMouseDown={(e) => { e.preventDefault(); setShowPassword(p => !p); }}
+                    className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground focus:outline-none">
                     {showPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
                   </button>
                 </div>
-                {mode === "signin" && !isLocked && attemptsRemaining() < 5 && (
-                  <p className="text-xs text-destructive">{attemptsRemaining()} attempts remaining before lockout</p>
+                {mode === "signin" && !isLocked && attemptsRemaining(email) < 5 && (
+                  <p className="text-xs text-destructive">{attemptsRemaining(email)} attempts remaining before lockout</p>
                 )}
               </div>
               <Button type="submit" variant="navy" size="lg" className="w-full" disabled={submitting || isLocked}>
