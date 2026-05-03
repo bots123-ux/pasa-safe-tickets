@@ -1,6 +1,6 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
-import { formatTime12h, arrivalTime } from "@/lib/time";
+import { formatTime12h } from "@/lib/time";
 import { ArrowLeft, Loader2, Wallet as WalletIcon, Smartphone, Check } from "lucide-react";
 import { format } from "date-fns";
 import { useAuth } from "@/lib/auth";
@@ -48,15 +48,22 @@ export default function Booking() {
   const [submitting, setSubmitting] = useState(false);
   const [confirmedTicketId, setConfirmedTicketId] = useState<string | null>(null);
 
+  // Fetch occupied seats using the secure RPC (returns all seats, not just your own)
+  const refreshOccupiedSeats = async (tid: string) => {
+    const { data, error } = await supabase.rpc("get_trip_occupied_seats", { p_trip_id: tid });
+    if (!error && data) {
+      setTaken(new Set((data as { seat_number: number }[]).map((r) => r.seat_number)));
+    }
+  };
+
   useEffect(() => {
     if (!tripId) return;
     let cancelled = false;
+
     (async () => {
       const { data: tripData, error } = await supabase
         .from("trips")
-        .select(
-          "id, travel_date, departure_time, bus_id, buses(plate_number, model, total_seats), routes(origin, destination, price_php, duration_minutes)",
-        )
+        .select("id, travel_date, departure_time, bus_id, buses(plate_number, model, total_seats), routes(origin, destination, price_php, duration_minutes)")
         .eq("id", tripId)
         .maybeSingle();
 
@@ -68,14 +75,8 @@ export default function Booking() {
       if (cancelled) return;
       setTrip(tripData as unknown as TripDetail);
 
-      const { data: tickets } = await supabase
-        .from("ticket")
-        .select("seat_number,status")
-        .eq("trip_id", tripId)
-        .in("status", ["pending", "paid", "used"]);
-      if (!cancelled) {
-        setTaken(new Set((tickets ?? []).map((x) => x.seat_number)));
-      }
+      // Use secure RPC to get occupied seats across ALL users
+      await refreshOccupiedSeats(tripId);
 
       if (user) {
         const { data: w } = await supabase.from("wallet").select("balance_php").eq("user_id", user.id).maybeSingle();
@@ -84,27 +85,15 @@ export default function Booking() {
       if (!cancelled) setLoading(false);
     })();
 
-    // Realtime: listen for new/updated tickets on this trip
+    // Realtime: when any ticket changes on this trip, refresh occupied seats
     const channel = supabase
       .channel(`trip-${tripId}`)
       .on(
         "postgres_changes",
         { event: "*", schema: "public", table: "ticket", filter: `trip_id=eq.${tripId}` },
-        (payload) => {
-          setTaken((prev) => {
-            const next = new Set(prev);
-            const row = (payload.new ?? payload.old) as { seat_number: number; status: string } | null;
-            if (!row) return next;
-            if (
-              payload.eventType === "DELETE" ||
-              (row.status !== "pending" && row.status !== "paid" && row.status !== "used")
-            ) {
-              next.delete(row.seat_number);
-            } else {
-              next.add(row.seat_number);
-            }
-            return next;
-          });
+        () => {
+          // Re-fetch via RPC so we always have the full, correct picture
+          refreshOccupiedSeats(tripId);
         },
       )
       .subscribe();
@@ -117,31 +106,39 @@ export default function Booking() {
 
   const price = trip ? Number(trip.routes.price_php) : 0;
 
+  // Seat tap handler — single tap to select, single tap to switch
+  const handleSeatClick = (n: number) => {
+    if (taken.has(n)) return;
+    setSelectedSeats((prev) => {
+      // If already selected → deselect
+      if (prev.includes(n)) return prev.filter((s) => s !== n);
+      // If under the limit → just add
+      if (prev.length < passengerCount) return [...prev, n];
+      // AT the limit: replace the last selected seat with this one (single-tap switch)
+      return [...prev.slice(0, prev.length - 1), n];
+    });
+  };
+
   const handleConfirm = async () => {
     if (!trip || !user || selectedSeats.length === 0) return;
-    if (method === "wallet" && walletBalance < price) {
+    const totalPrice = price * selectedSeats.length;
+    if (method === "wallet" && walletBalance < totalPrice) {
       toast.error("Insufficient wallet balance.");
       return;
     }
     setSubmitting(true);
     try {
-      const totalPrice = price * selectedSeats.length;
-      if (method === "wallet" && walletBalance < totalPrice) {
-        toast.error("Insufficient wallet balance.");
-        setSubmitting(false);
-        return;
-      }
-
-      // Insert a ticket for each selected seat
       const ticketIds: string[] = [];
+
       for (const seatNum of selectedSeats) {
+        // Insert ticket as pending first
         const { data: ticketRow, error: tErr } = await supabase
           .from("ticket")
           .insert({
             user_id: user.id,
             trip_id: trip.id,
             seat_number: seatNum,
-            status: "paid",
+            status: "pending",
             price_php: price,
           })
           .select("id")
@@ -151,45 +148,34 @@ export default function Booking() {
         // Set QR code
         await supabase.from("ticket").update({ qr_code: `BUSPAY:${ticketRow.id}` }).eq("id", ticketRow.id);
 
-        // Insert payment record
-        const { error: pErr } = await supabase.from("payments").insert({
-          user_id: user.id,
-          ticket_id: ticketRow.id,
-          amount_php: price,
-          method,
-          status: "completed",
-          reference: method === "gcash" ? `GCASH-${Date.now()}-${seatNum}` : null,
+        // Confirm payment via secure DB function (validates amount, marks paid, inserts payment)
+        const { data: confirmed, error: cErr } = await supabase.rpc("confirm_ticket_payment", {
+          p_ticket_id: ticketRow.id,
+          p_payment_method: method,
+          p_amount: price,
         });
-        if (pErr) throw pErr;
+        if (cErr) throw cErr;
+        if (!confirmed) throw new Error("Payment confirmation failed");
 
         ticketIds.push(ticketRow.id);
       }
 
-      // Deduct wallet once for total
+      // Deduct wallet once for total via secure function
       if (method === "wallet") {
-        await supabase.from("wallet").update({ balance_php: walletBalance - totalPrice }).eq("user_id", user.id);
-        await supabase.from("wallet_transactions").insert({
-          user_id: user.id,
-          type: "payment",
-          amount_php: -totalPrice,
-          description: `${selectedSeats.length} ticket(s) · ${trip.routes.origin} → ${trip.routes.destination}`,
+        const { data: deducted, error: dErr } = await supabase.rpc("deduct_wallet", {
+          p_user_id: user.id,
+          p_amount: totalPrice,
+          p_description: `${selectedSeats.length} ticket(s) · ${trip.routes.origin} → ${trip.routes.destination}`,
         });
+        if (dErr) throw dErr;
+        if (!deducted) { toast.error("Insufficient wallet balance."); return; }
+        setWalletBalance((b) => b - totalPrice);
       }
-
-      // Send one booking notification with correct PH time
-      const depDate = format(new Date(trip.travel_date + "T00:00:00"), "MMM d, yyyy");
-      const depTime = trip.departure_time.slice(0, 5);
-      await supabase.from("notifications").insert({
-        user_id: user.id,
-        type: "booking",
-        title: "Booking confirmed! 🎉",
-        body: `${selectedSeats.length} seat(s) #${selectedSeats.join(", #")} · ${trip.routes.origin} → ${trip.routes.destination} · ${depDate} at ${depTime}`,
-      });
 
       setConfirmedTicketId(ticketIds[0]);
       setStep("done");
     } catch (err: any) {
-      toast.error(err?.message ?? "Booking failed");
+      toast.error(err?.message ?? "Booking failed. The seat may have just been taken.");
     } finally {
       setSubmitting(false);
     }
@@ -219,7 +205,6 @@ export default function Booking() {
             {trip.routes.origin} → {trip.routes.destination} · {format(new Date(trip.travel_date + "T00:00:00"), "EEE, MMM d")} · {formatTime12h(trip.departure_time)}
           </p>
 
-
           {/* Passenger count */}
           <div className="mb-5 flex items-center justify-between rounded-2xl border border-border bg-card p-4">
             <div>
@@ -240,44 +225,35 @@ export default function Booking() {
           </div>
 
           {/* Legend */}
-          <div className="mb-5 flex items-center gap-4 text-xs">
+          <div className="mb-3 flex items-center gap-4 text-xs">
             <Legend color="bg-seat-available" label="Available" />
             <Legend color="bg-seat-selected" label="Selected" />
             <Legend color="bg-seat-taken" label="Taken" />
           </div>
 
+          {/* Hint */}
+          <p className="mb-4 text-xs text-muted-foreground">
+            Tap a seat to select it. Tap another to switch.
+          </p>
+
           {/* Seat map */}
           <div className="rounded-3xl border-2 border-border bg-gradient-card p-5 shadow-soft">
-            {/* Driver area */}
             <div className="mb-4 flex items-center justify-between rounded-xl border border-dashed border-border px-3 py-2 text-xs text-muted-foreground">
               <span>🚍 Front · Driver</span>
               <span>Door →</span>
             </div>
-
             <div className="space-y-2">
               {SEAT_LAYOUT.map(({ row, left, right }) => (
                 <div key={row} className="flex items-center justify-between gap-2">
                   <div className="flex gap-2">
                     {left.map((n) => (
-                      <Seat key={n} n={n} taken={taken.has(n)} selected={selectedSeats.includes(n)} onClick={() => {
-                    if (selectedSeats.includes(n)) {
-                      setSelectedSeats(prev => prev.filter(s => s !== n));
-                    } else if (selectedSeats.length < passengerCount) {
-                      setSelectedSeats(prev => [...prev, n]);
-                    }
-                  }} />
+                      <Seat key={n} n={n} taken={taken.has(n)} selected={selectedSeats.includes(n)} onClick={() => handleSeatClick(n)} />
                     ))}
                   </div>
                   <span className="w-6 text-center text-xs font-semibold text-muted-foreground">{row}</span>
                   <div className="flex gap-2">
                     {right.map((n) => (
-                      <Seat key={n} n={n} taken={taken.has(n)} selected={selectedSeats.includes(n)} onClick={() => {
-                    if (selectedSeats.includes(n)) {
-                      setSelectedSeats(prev => prev.filter(s => s !== n));
-                    } else if (selectedSeats.length < passengerCount) {
-                      setSelectedSeats(prev => [...prev, n]);
-                    }
-                  }} />
+                      <Seat key={n} n={n} taken={taken.has(n)} selected={selectedSeats.includes(n)} onClick={() => handleSeatClick(n)} />
                     ))}
                   </div>
                 </div>
@@ -307,7 +283,6 @@ export default function Booking() {
           <h1 className="mb-1 text-2xl font-extrabold">{t("pay.title")}</h1>
           <p className="mb-5 text-sm text-muted-foreground">{t("pay.method")}</p>
 
-          {/* Summary card */}
           <div className="mb-5 rounded-2xl border border-border bg-card p-5">
             <div className="flex items-baseline justify-between">
               <span className="text-sm text-muted-foreground">Total</span>
@@ -334,7 +309,6 @@ export default function Booking() {
           </div>
 
           <div className="space-y-3">
-
             <PayOption
               icon={<Smartphone className="h-5 w-5" />}
               label={t("pay.gcash")}
@@ -345,8 +319,8 @@ export default function Booking() {
             <PayOption
               icon={<WalletIcon className="h-5 w-5" />}
               label={`${t("pay.wallet")} · ₱${walletBalance.toLocaleString()}`}
-              hint={walletBalance < price ? "Insufficient" : "Instant"}
-              disabled={walletBalance < price}
+              hint={walletBalance < price * passengerCount ? "Insufficient" : "Instant"}
+              disabled={walletBalance < price * passengerCount}
               active={method === "wallet"}
               onClick={() => setMethod("wallet")}
             />
@@ -411,19 +385,9 @@ function Legend({ color, label }: { color: string; label: string }) {
 }
 
 function PayOption({
-  icon,
-  label,
-  hint,
-  active,
-  onClick,
-  disabled,
+  icon, label, hint, active, onClick, disabled,
 }: {
-  icon: React.ReactNode;
-  label: string;
-  hint?: string;
-  active: boolean;
-  onClick: () => void;
-  disabled?: boolean;
+  icon: React.ReactNode; label: string; hint?: string; active: boolean; onClick: () => void; disabled?: boolean;
 }) {
   return (
     <button
